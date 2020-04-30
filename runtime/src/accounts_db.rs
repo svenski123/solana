@@ -23,6 +23,7 @@ use crate::{
     append_vec::{AppendVec, StoredAccount, StoredMeta},
     bank::deserialize_from_snapshot,
 };
+use atomic_enum::atomic_enum;
 use bincode::{deserialize_from, serialize_into};
 use byteorder::{ByteOrder, LittleEndian};
 use fs_extra::dir::CopyOptions;
@@ -45,10 +46,11 @@ use solana_sdk::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    convert::TryInto,
     fmt,
     io::{BufReader, Cursor, Error as IOError, ErrorKind, Read, Result as IOResult},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicIsize, AtomicUsize, Ordering},
     sync::{Arc, Mutex, RwLock},
 };
 use tempfile::TempDir;
@@ -182,11 +184,16 @@ impl<'de> Deserialize<'de> for AccountStorage {
     }
 }
 
-#[derive(Debug, PartialEq, Copy, Clone, Deserialize, Serialize)]
+#[atomic_enum]
+#[derive(PartialEq, Deserialize, Serialize)]
 pub enum AccountStorageStatus {
     Available = 0,
     Full = 1,
     Candidate = 2,
+}
+
+impl Default for AtomicAccountStorageStatus {
+    fn default() -> Self { Self::new(AccountStorageStatus::Available) }
 }
 
 #[derive(Debug)]
@@ -213,6 +220,25 @@ pub struct AccountStorageEntry {
     /// status corresponding to the storage, lets us know that
     ///  the append_vec, once maxed out, then emptied, can be reclaimed
     count_and_status: RwLock<(usize, AccountStorageStatus)>,
+
+    #[serde(skip)]
+    count: AtomicIsize,
+
+    #[serde(skip)]
+    status: AtomicAccountStorageStatus,
+}
+
+impl Default for AccountStorageEntry {
+    fn default() -> Self {
+	Self {
+	    id: 0,
+	    slot: 0,
+	    accounts: AppendVec::new_empty_map(0),
+	    count_and_status: RwLock::new((0, AccountStorageStatus::Available)),
+	    count: AtomicIsize::new(0),
+	    status: AtomicAccountStorageStatus::new(AccountStorageStatus::Available),
+	}
+    }
 }
 
 impl AccountStorageEntry {
@@ -225,37 +251,28 @@ impl AccountStorageEntry {
             id,
             slot,
             accounts,
-            count_and_status: RwLock::new((0, AccountStorageStatus::Available)),
+	    status: AtomicAccountStorageStatus::default(),
+	    ..AccountStorageEntry::default()
         }
     }
 
-    pub fn set_status(&self, mut status: AccountStorageStatus) {
-        let mut count_and_status = self.count_and_status.write().unwrap();
-
-        let count = count_and_status.0;
-
-        if status == AccountStorageStatus::Full && count == 0 {
-            // this case arises when the append_vec is full (store_ptrs fails),
-            //  but all accounts have already been removed from the storage
-            //
-            // the only time it's safe to call reset() on an append_vec is when
-            //  every account has been removed
-            //          **and**
-            //  the append_vec has previously been completely full
-            //
-            self.accounts.reset();
-            status = AccountStorageStatus::Available;
+    fn new_with_status(path: &Path,
+		       slot: Slot,
+		       id: usize,
+		       file_size: u64,
+		       status: AccountStorageStatus) -> Self {
+        AccountStorageEntry {
+	    status: AtomicAccountStorageStatus::new(status),
+	    ..Self::new(path, slot, id, file_size)
         }
-
-        *count_and_status = (count, status);
     }
 
     pub fn status(&self) -> AccountStorageStatus {
-        self.count_and_status.read().unwrap().1
+        self.status.load(Ordering::Acquire)
     }
 
     pub fn count(&self) -> usize {
-        self.count_and_status.read().unwrap().0
+        self.count.load(Ordering::Acquire).try_into().unwrap()
     }
 
     pub fn has_accounts(&self) -> bool {
@@ -274,55 +291,82 @@ impl AccountStorageEntry {
         self.accounts.flush()
     }
 
-    fn add_account(&self) {
-        let mut count_and_status = self.count_and_status.write().unwrap();
-        *count_and_status = (count_and_status.0 + 1, count_and_status.1);
+    fn set_count(&self, count: usize) -> usize {
+	let count_new = count as isize;
+	let count_old = self.count.swap(count_new, Ordering::AcqRel);
+	assert!(count_old >= 0 && count_new >= 0,
+		"bad account set: count_old: {} count_new: {} slot: {} store: {}",
+		count_old, count_new, self.slot, self.id);
+	count_old as usize
     }
 
-    fn try_available(&self) -> bool {
-        let mut count_and_status = self.count_and_status.write().unwrap();
-        let (count, status) = *count_and_status;
-
-        if status == AccountStorageStatus::Available {
-            *count_and_status = (count, AccountStorageStatus::Candidate);
-            true
-        } else {
-            false
-        }
+    fn dec_count(&self, delta: usize) -> usize {
+	let count_chg = delta as isize;
+	let count_old = self.count.fetch_sub(count_chg, Ordering::AcqRel);
+	let count_new = count_old - count_chg;
+	assert!(count_chg > 0
+		&& count_old >= 0
+		&& count_new >= 0,
+		"bad account decrement: count_old: {} count_chg: {} count_new: {} slot: {} store: {}",
+		count_old, count_chg, count_new, self.slot, self.id);
+	count_old as usize
     }
 
-    fn remove_account(&self) -> usize {
-        let mut count_and_status = self.count_and_status.write().unwrap();
-        let (mut count, mut status) = *count_and_status;
+    fn inc_count(&self, delta: usize) -> usize {
+	let count_chg = delta as isize;
+	let count_old = self.count.fetch_add(count_chg, Ordering::AcqRel);
+	let count_new = count_old + count_chg;
+	assert!(count_chg > 0
+		&& count_old >= 0
+		&& count_new >= 0,
+		"bad account increment: count_old: {} count_chg: {} count_new: {} slot: {} store: {}",
+		count_old, count_chg, count_new, self.slot, self.id);
+	count_old as usize
+    }
 
-        if count == 1 && status == AccountStorageStatus::Full {
-            // this case arises when we remove the last account from the
-            //  storage, but we've learned from previous write attempts that
-            //  the storage is full
-            //
-            // the only time it's safe to call reset() on an append_vec is when
-            //  every account has been removed
-            //          **and**
-            //  the append_vec has previously been completely full
-            //
-            // otherwise, the storage may be in flight with a store()
-            //   call
-            self.accounts.reset();
-            status = AccountStorageStatus::Available;
-        }
+    fn set_status_from_candidate(&self, new_status: AccountStorageStatus) {
+	if cfg!(debug_assertions) || true {
+	    assert_eq!(AccountStorageStatus::Candidate,
+		       self.status.compare_and_swap(
+			   AccountStorageStatus::Candidate,
+			   new_status,
+			   Ordering::Release))
+	} else {
+	    self.status.store(new_status,
+			      Ordering::Release)
+	}
+    }
 
-        // Some code path is removing accounts too many; this may result in an
-        // unintended reveal of old state for unrelated accounts.
-        assert!(
-            count > 0,
-            "double remove of account in slot: {}/store: {}!!",
-            self.slot,
-            self.id
-        );
+    fn mark_candidate_available(&self) {
+	self.set_status_from_candidate(AccountStorageStatus::Available)
+    }
 
-        count -= 1;
-        *count_and_status = (count, status);
-        count
+    fn mark_candidate_full(&self) {
+	self.set_status_from_candidate(AccountStorageStatus::Full)
+    }
+
+    fn maybe_set_status(&self,
+			new_status: AccountStorageStatus,
+			old_status: AccountStorageStatus) -> bool {
+	old_status == self.status.compare_and_swap(old_status,
+						   new_status,
+						   Ordering::Release)
+    }
+
+    fn try_set_candidate(&self) -> bool {
+	self.maybe_set_status(AccountStorageStatus::Candidate,
+			      AccountStorageStatus::Available)
+    }
+
+    fn remove_account(&self) -> bool {
+	let count_old = self.dec_count(1);
+	// iff page was full, mark it as available
+	if count_old == 1 {
+	    self.maybe_set_status(AccountStorageStatus::Available,
+				  AccountStorageStatus::Full);
+	}
+	// return true if last account was just removed
+	count_old == 1
     }
 
     pub fn set_file<P: AsRef<Path>>(&mut self, path: P) -> IOResult<()> {
@@ -668,12 +712,17 @@ impl AccountsDB {
         Ok(())
     }
 
-    fn new_storage_entry(&self, slot: Slot, path: &Path, size: u64) -> AccountStorageEntry {
-        AccountStorageEntry::new(
+    fn new_storage_entry(&self,
+			 slot: Slot,
+			 path: &Path,
+			 size: u64,
+			 status: AccountStorageStatus) -> AccountStorageEntry {
+        AccountStorageEntry::new_with_status(
             path,
             slot,
             self.next_id.fetch_add(1, Ordering::Relaxed),
             size,
+	    status,
         )
     }
 
@@ -850,7 +899,7 @@ impl AccountsDB {
                 } else {
                     store_counts.insert(
                         account_info.store_id,
-                        store.count_and_status.read().unwrap().0 - 1,
+                        store.count() - 1,
                     );
                 }
             }
@@ -1018,8 +1067,6 @@ impl AccountsDB {
                 write_versions.push(*write_version);
             }
 
-            let shrunken_store = self.create_and_insert_store(slot, aligned_total);
-
             // here, we're writing back alive_accounts. That should be an atomic operation
             // without use of rather wide locks in this whole function, because we're
             // mutating rooted slots; There should be no writers to them.
@@ -1027,7 +1074,7 @@ impl AccountsDB {
                 slot,
                 &accounts,
                 &hashes,
-                |_| shrunken_store.clone(),
+                |slot| self.create_and_insert_candidate_store(slot, aligned_total),
                 write_versions.into_iter(),
             );
             let reclaims = self.update_index(slot, infos, &accounts);
@@ -1211,11 +1258,11 @@ impl AccountsDB {
                 let to_skip = thread_rng().gen_range(0, slot_stores.len());
 
                 for (i, store) in slot_stores.values().cycle().skip(to_skip).enumerate() {
-                    if store.try_available() {
+                    if store.try_set_candidate() {
                         let ret = store.clone();
                         drop(stores);
                         if create_extra {
-                            self.create_and_insert_store(slot, self.file_size);
+                            self.create_and_insert_available_store(slot, self.file_size);
                         }
                         return ret;
                     }
@@ -1229,21 +1276,28 @@ impl AccountsDB {
 
         drop(stores);
 
-        let store = self.create_and_insert_store(slot, self.file_size);
-        store.try_available();
+        let store = self.create_and_insert_candidate_store(slot, self.file_size);
         store
     }
 
-    fn create_and_insert_store(&self, slot: Slot, size: u64) -> Arc<AccountStorageEntry> {
+    fn create_and_insert_store(&self, slot: Slot, size: u64, status: AccountStorageStatus) -> Arc<AccountStorageEntry> {
         let path_index = thread_rng().gen_range(0, self.paths.len());
         let store =
-            Arc::new(self.new_storage_entry(slot, &Path::new(&self.paths[path_index]), size));
+            Arc::new(self.new_storage_entry(slot, &Path::new(&self.paths[path_index]), size, status));
         let store_for_index = store.clone();
 
         let mut stores = self.storage.write().unwrap();
         let slot_storage = stores.0.entry(slot).or_insert_with(HashMap::new);
         slot_storage.insert(store.id, store_for_index);
         store
+    }
+
+    fn create_and_insert_available_store(&self, slot: Slot, size: u64) -> Arc<AccountStorageEntry> {
+	self.create_and_insert_store(slot, size, AccountStorageStatus::Available)
+    }
+
+    fn create_and_insert_candidate_store(&self, slot: Slot, size: u64) -> Arc<AccountStorageEntry> {
+	self.create_and_insert_store(slot, size, AccountStorageStatus::Candidate)
     }
 
     pub fn purge_slot(&self, slot: Slot) {
@@ -1396,23 +1450,33 @@ impl AccountsDB {
             })
             .collect();
         let mut infos: Vec<AccountInfo> = Vec::with_capacity(with_meta.len());
+	let mut next_storage = None;
         while infos.len() < with_meta.len() {
-            let storage = storage_finder(slot);
+	    let storage = next_storage.take().unwrap_or_else(|| storage_finder(slot));
             let rvs = storage
                 .accounts
                 .append_accounts(&with_meta[infos.len()..], &hashes[infos.len()..]);
             if rvs.is_empty() {
-                storage.set_status(AccountStorageStatus::Full);
+		let storage_was_reset =
+		    storage.count() == 0
+		    && !storage.accounts.is_empty()
+		    && { storage.accounts.reset(); true };
 
                 // See if an account overflows the default append vec size.
                 let data_len = (with_meta[infos.len()].1.data.len() + 4096) as u64;
                 if data_len > self.file_size {
-                    self.create_and_insert_store(slot, data_len * 2);
+		    next_storage = Some(self.create_and_insert_candidate_store(slot, data_len * 2));
+		    storage.mark_candidate_available();
+		} else if storage_was_reset {
+		    next_storage = Some(storage);
+		} else {
+		    storage.mark_candidate_full();
                 }
                 continue;
             }
+	    // increment page account count by number of added accounts
+	    storage.inc_count(rvs.len());
             for (offset, (_, account)) in rvs.iter().zip(&with_meta[infos.len()..]) {
-                storage.add_account();
                 infos.push(AccountInfo {
                     store_id: storage.id,
                     offset: *offset,
@@ -1420,7 +1484,7 @@ impl AccountsDB {
                 });
             }
             // restore the state to available
-            storage.set_status(AccountStorageStatus::Available);
+	    storage.mark_candidate_available();
         }
         infos
     }
@@ -1708,8 +1772,7 @@ impl AccountsDB {
                         *slot, store.slot,
                         "AccountDB::accounts_index corrupted. Storage should only point to one slot"
                     );
-                    let count = store.remove_account();
-                    if count == 0 {
+                    if store.remove_account() {
                         dead_slots.insert(*slot);
                     }
                 }
@@ -1974,16 +2037,16 @@ impl AccountsDB {
         for slot_stores in storage.0.values() {
             for (id, store) in slot_stores {
                 if let Some(count) = counts.get(&id) {
+		    let count_before = store.set_count(*count);
                     trace!(
                         "id: {} setting count: {} cur: {}",
                         id,
-                        count,
-                        store.count_and_status.read().unwrap().0
+			count,
+                        count_before,
                     );
-                    store.count_and_status.write().unwrap().0 = *count;
                 } else {
+		    let _count_before = store.set_count(0);
                     trace!("id: {} clearing count", id);
-                    store.count_and_status.write().unwrap().0 = 0;
                 }
             }
         }
@@ -3603,7 +3666,7 @@ pub mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "double remove of account in slot: 0/store: 0!!")]
+    #[should_panic(expected = "bad account decrement: count_old: 0 count_chg: 1 count_new: -1 slot: 0 store: 0")]
     fn test_storage_remove_account_double_remove() {
         let accounts = AccountsDB::new(Vec::new());
         let pubkey = Pubkey::new_rand();
