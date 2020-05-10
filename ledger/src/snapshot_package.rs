@@ -1,3 +1,4 @@
+use crate::snapshot_utils::SnapshotVersion;
 use solana_runtime::{accounts_db::SnapshotStorages, bank::BankSlotDelta};
 use solana_sdk::clock::Slot;
 use solana_sdk::hash::Hash;
@@ -19,6 +20,7 @@ pub struct SnapshotPackage {
     pub storages: SnapshotStorages,
     pub tar_output_file: PathBuf,
     pub hash: Hash,
+    pub snapshot_version: SnapshotVersion,
 }
 
 impl SnapshotPackage {
@@ -29,6 +31,7 @@ impl SnapshotPackage {
         storages: SnapshotStorages,
         tar_output_file: PathBuf,
         hash: Hash,
+	snapshot_version: SnapshotVersion,
     ) -> Self {
         Self {
             root,
@@ -37,6 +40,7 @@ impl SnapshotPackage {
             storages,
             tar_output_file,
             hash,
+	    snapshot_version,
         }
     }
 }

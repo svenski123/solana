@@ -353,6 +353,7 @@ mod tests {
     use solana_ledger::{
         genesis_utils::{create_genesis_config, GenesisConfigInfo},
         get_tmp_ledger_path,
+	snapshot_utils::SnapshotVersion,
     };
     use solana_runtime::bank::Bank;
     use solana_sdk::signature::Signer;
@@ -423,6 +424,7 @@ mod tests {
                 snapshot_interval_slots: 0,
                 snapshot_package_output_path: PathBuf::from("/"),
                 snapshot_path: PathBuf::from("/"),
+		snapshot_version: SnapshotVersion::default(),
             }),
             cluster_info,
             None,

@@ -16,6 +16,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub use crate::snapshot_utils::SnapshotVersion;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SnapshotConfig {
     // Generate a new snapshot every this many slots
@@ -26,6 +28,9 @@ pub struct SnapshotConfig {
 
     // Where to place the snapshots for recent slots
     pub snapshot_path: PathBuf,
+
+    // Snapshot version to generate
+    pub snapshot_version: SnapshotVersion,
 }
 
 #[derive(Error, Debug)]
@@ -289,7 +294,7 @@ impl BankForks {
 
         let storages: Vec<_> = bank.get_snapshot_storages();
         let mut add_snapshot_time = Measure::start("add-snapshot-ms");
-        snapshot_utils::add_snapshot(&config.snapshot_path, &bank, &storages)?;
+        snapshot_utils::add_snapshot(&config.snapshot_path, &bank, &storages, config.snapshot_version)?;
         add_snapshot_time.stop();
         inc_new_counter_info!("add-snapshot-ms", add_snapshot_time.as_ms() as usize);
 
@@ -307,6 +312,7 @@ impl BankForks {
             slots_to_snapshot,
             &config.snapshot_package_output_path,
             storages,
+	    config.snapshot_version,
         )?;
 
         // Send the package to the packaging thread

@@ -80,10 +80,10 @@ mod tests {
     use bincode::serialize_into;
     use solana_ledger::{
         snapshot_package::SnapshotPackage,
-        snapshot_utils::{self, SNAPSHOT_STATUS_CACHE_FILE_NAME},
+        snapshot_utils::{self, SNAPSHOT_STATUS_CACHE_FILE_NAME, SnapshotVersion},
     };
     use solana_runtime::{
-        accounts_db::AccountStorageEntry, bank::BankSlotDelta, bank::MAX_SNAPSHOT_DATA_FILE_SIZE,
+        accounts_db::AccountStorageEntry, bank::BankSlotDelta,
     };
     use solana_sdk::hash::Hash;
     use std::{
@@ -171,6 +171,7 @@ mod tests {
             vec![storage_entries],
             output_tar_path.clone(),
             Hash::default(),
+	    SnapshotVersion::default(),
         );
 
         // Make tarball from packageable snapshot
@@ -182,7 +183,6 @@ mod tests {
         let dummy_slot_deltas: Vec<BankSlotDelta> = vec![];
         snapshot_utils::serialize_snapshot_data_file(
             &snapshots_dir.join(SNAPSHOT_STATUS_CACHE_FILE_NAME),
-            MAX_SNAPSHOT_DATA_FILE_SIZE,
             |stream| {
                 serialize_into(stream, &dummy_slot_deltas)?;
                 Ok(())

@@ -1266,6 +1266,7 @@ fn setup_snapshot_validator_config(
         snapshot_interval_slots,
         snapshot_package_output_path: PathBuf::from(snapshot_output_path.path()),
         snapshot_path: PathBuf::from(snapshot_dir.path()),
+	snapshot_version: snapshot_utils::SnapshotVersion::default(),
     };
 
     // Create the account paths
