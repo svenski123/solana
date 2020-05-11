@@ -57,7 +57,7 @@ use solana_vote_program::vote_state::VoteState;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    path::{PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Arc, RwLock, RwLockReadGuard},
@@ -4887,10 +4887,11 @@ mod tests {
         let mut writer = Cursor::new(&mut buf);
         serialize_into(&mut writer, &bank2).unwrap();
         crate::serde_utils::bankrc_to_stream(
-	    &mut std::io::BufWriter::new(&mut writer),
-	    &bank2.rc,
-	    &snapshot_storages
-	).unwrap();
+            &mut std::io::BufWriter::new(&mut writer),
+            &bank2.rc,
+            &snapshot_storages,
+        )
+        .unwrap();
 
         let mut rdr = Cursor::new(&buf[..]);
         let mut dbank: Bank = bincode::deserialize_from(&mut rdr).unwrap();

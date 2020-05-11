@@ -80,11 +80,9 @@ mod tests {
     use bincode::serialize_into;
     use solana_ledger::{
         snapshot_package::SnapshotPackage,
-        snapshot_utils::{self, SNAPSHOT_STATUS_CACHE_FILE_NAME, SnapshotVersion},
+        snapshot_utils::{self, SnapshotVersion, SNAPSHOT_STATUS_CACHE_FILE_NAME},
     };
-    use solana_runtime::{
-        accounts_db::AccountStorageEntry, bank::BankSlotDelta,
-    };
+    use solana_runtime::{accounts_db::AccountStorageEntry, bank::BankSlotDelta};
     use solana_sdk::hash::Hash;
     use std::{
         fs::{self, remove_dir_all, OpenOptions},
@@ -171,7 +169,7 @@ mod tests {
             vec![storage_entries],
             output_tar_path.clone(),
             Hash::default(),
-	    SnapshotVersion::default(),
+            SnapshotVersion::default(),
         );
 
         // Make tarball from packageable snapshot

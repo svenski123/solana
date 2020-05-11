@@ -21,7 +21,10 @@ use solana_core::{
     validator::{Validator, ValidatorConfig},
 };
 use solana_download_utils::{download_genesis_if_missing, download_snapshot};
-use solana_ledger::{bank_forks::{SnapshotConfig, SnapshotVersion}, hardened_unpack::unpack_genesis_archive};
+use solana_ledger::{
+    bank_forks::{SnapshotConfig, SnapshotVersion},
+    hardened_unpack::unpack_genesis_archive,
+};
 use solana_perf::recycler::enable_recycler_warming;
 use solana_sdk::{
     clock::Slot,
@@ -914,9 +917,11 @@ pub fn main() {
     });
 
     let snapshot_version = match matches.value_of("snapshot_version") {
-	Some(s) => s.parse::<SnapshotVersion>()
-	    .unwrap_or_else(|e| { eprintln!("Error: {}", e); exit(1) }),
-	None => SnapshotVersion::default(),
+        Some(s) => s.parse::<SnapshotVersion>().unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            exit(1)
+        }),
+        None => SnapshotVersion::default(),
     };
     validator_config.snapshot_config = Some(SnapshotConfig {
         snapshot_interval_slots: if snapshot_interval_slots > 0 {
@@ -926,7 +931,7 @@ pub fn main() {
         },
         snapshot_path,
         snapshot_package_output_path: ledger_path.clone(),
-	snapshot_version,
+        snapshot_version,
     });
 
     if matches.is_present("limit_ledger_size") {

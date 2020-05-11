@@ -31,7 +31,7 @@ impl SnapshotPackage {
         storages: SnapshotStorages,
         tar_output_file: PathBuf,
         hash: Hash,
-	snapshot_version: SnapshotVersion,
+        snapshot_version: SnapshotVersion,
     ) -> Self {
         Self {
             root,
@@ -40,7 +40,7 @@ impl SnapshotPackage {
             storages,
             tar_output_file,
             hash,
-	    snapshot_version,
+            snapshot_version,
         }
     }
 }
