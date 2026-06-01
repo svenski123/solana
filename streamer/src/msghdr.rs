@@ -1,5 +1,4 @@
-#![cfg(target_os = "linux")]
-
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use {
     libc::{iovec, msghdr, sockaddr_storage, socklen_t},
     std::{
