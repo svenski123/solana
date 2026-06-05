@@ -1,6 +1,6 @@
 //! The `sendmmsg` module provides sendmmsg() API implementation
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use {
     crate::msghdr::create_msghdr,
     itertools::izip,
@@ -35,7 +35,7 @@ impl From<SendPktsError> for TransportError {
 }
 
 // The type and lifetime constraints are overspecified to match 'linux' code.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 pub fn batch_send<'a, S, T: 'a + ?Sized>(
     sock: &UdpSocket,
     packets: impl IntoIterator<Item = (&'a T, S), IntoIter: ExactSizeIterator>,
@@ -62,7 +62,7 @@ where
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn mmsghdr_for_packet(
     packet: &[u8],
     dest: &SocketAddr,
@@ -124,6 +124,114 @@ fn mmsghdr_for_packet(
     });
 }
 
+#[cfg(target_os = "freebsd")]
+fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut [mmsghdr]) -> Result<(), SendPktsError> {
+    let sock_fd = sock.as_raw_fd();
+    let mut total_sent = 0;
+    let mut erropt = None;
+
+    const MAX_FAILURES: u32 = 3;
+    let mut failures: u32 = 0;
+
+    let mut pkts = &mut *hdrs;
+    while !pkts.is_empty() {
+        let pkts_len = pkts.len() as libc::size_t;
+        let n = unsafe { libc::sendmmsg(sock_fd, &mut pkts[0], pkts_len, libc::MSG_DONTWAIT) };
+        if n > 0 {
+            total_sent += n as usize;
+            pkts = &mut pkts[n as usize..];
+            failures = 0;
+            continue;
+        }
+
+        let errno = io::Error::last_os_error();
+        failures += 1;
+
+        // Either we have seen too many consecutive failures, sendmmsg
+        // has returned a non-positive number other than -1, or sendmmsg
+        // returned a non-transient error. In all cases, treat as error
+        // and skip one message.
+        if failures > MAX_FAILURES
+            || n != -1
+            || errno
+                .raw_os_error()
+                .is_some_and(|e| e != libc::ENOBUFS && e != libc::EAGAIN)
+        {
+            if erropt.is_none() {
+                erropt = Some(errno);
+            }
+            pkts = &mut pkts[1 as usize..];
+            continue;
+        }
+
+        // Handle transient sending errors due to busy
+        // hardware by blocking in poll() and retrying
+        let mut fds = [libc::pollfd {
+            fd: sock_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        }];
+        debug!(
+            "sendmmsg({},{}): errno {}; waiting for socket to become writable",
+            sock_fd, pkts_len, errno,
+        );
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 5000) };
+
+        // poll reported an event on the socket; either it is writable
+        // or an error condition has arisen. In either case, loop again
+        // to perform the write or pickup the error.
+        if rc > 0 {
+            let pollout = fds[0].revents & libc::POLLOUT;
+            let pollerr = fds[0].revents & libc::POLLERR;
+            let pollhup = fds[0].revents & libc::POLLHUP;
+            let pollnval = fds[0].revents & libc::POLLNVAL;
+            macro_rules! log {
+		($log:ident) => {
+		    $log!("sendmmsg({},{}): poll socket status: POLLOUT={} POLLERR={} POLLHUP={} POLLNVAL={}",
+			  sock_fd, pkts_len, pollout, pollerr, pollhup, pollnval)
+		}
+	    }
+            // If any bit set other than POLLOUT, log as error
+            if fds[0].revents & !libc::POLLOUT != 0 {
+                log!(error)
+            } else {
+                log!(info)
+            }
+            continue;
+        }
+
+        // Either poll itself returned an error or it timed out
+        if rc < 0 {
+            let poll_errno = io::Error::last_os_error();
+            error!(
+                "sendmmsg({},{}): while handling sendmsg errno {}: {}; poll errno {}: {}",
+                sock_fd,
+                pkts_len,
+                errno.raw_os_error().unwrap_or_default(),
+                errno,
+                poll_errno.raw_os_error().unwrap_or_default(),
+                poll_errno,
+            );
+        } else {
+            error!(
+                "sendmsg({},{}): poll on unwritable udp socket timed out",
+                sock_fd, pkts_len
+            );
+        }
+
+        if erropt.is_none() {
+            erropt = Some(errno);
+        }
+        pkts = &mut pkts[1 as usize..];
+    }
+
+    if let Some(err) = erropt {
+        return Err(SendPktsError::IoError(err, hdrs.len() - total_sent));
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut [mmsghdr]) -> Result<(), SendPktsError> {
     let sock_fd = sock.as_raw_fd();
@@ -157,10 +265,13 @@ fn sendmmsg_retry(sock: &UdpSocket, hdrs: &mut [mmsghdr]) -> Result<(), SendPkts
     }
 }
 
+#[cfg(target_os = "freebsd")]
+const MAX_IOV: usize = libc::IOV_MAX as usize;
+
 #[cfg(target_os = "linux")]
 const MAX_IOV: usize = libc::UIO_MAXIOV as usize;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 fn batch_send_max_iov<'a, S, T: 'a + ?Sized>(
     sock: &UdpSocket,
     packets: impl IntoIterator<Item = (&'a T, S), IntoIter: ExactSizeIterator>,
@@ -204,7 +315,7 @@ where
 
 // Need &'a to ensure that raw packet pointers obtained in mmsghdr_for_packet
 // stay valid.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
 pub fn batch_send<'a, S, T: 'a + ?Sized>(
     sock: &UdpSocket,
     packets: impl IntoIterator<Item = (&'a T, S), IntoIter: ExactSizeIterator>,
@@ -244,7 +355,7 @@ mod tests {
         crate::{
             packet::Packet,
             recvmmsg::recv_mmsg,
-            sendmmsg::{SendPktsError, batch_send, multi_target_send},
+            sendmmsg::{batch_send, multi_target_send, SendPktsError},
         },
         assert_matches::assert_matches,
         solana_net_utils::sockets::bind_to_localhost_unique,
